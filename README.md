@@ -1,75 +1,67 @@
-# Video Rotate Context Menu
+# Video Rotate Context Menu for Windows
 
-This package adds a Windows Explorer context menu for common video files:
+This project adds a per-user Windows Explorer context menu for common video
+files and uses `ffmpeg` to write display rotation metadata without re-encoding
+the streams.
 
-- Counterclockwise 90 degrees
-- Rotate 180 degrees
-- Clockwise 90 degrees
-- Clear rotation metadata (0 degrees)
+It is designed for Windows 10 and Windows 11, with explicit compatibility work
+for `Windows PowerShell 5.1` and Win11 classic context-menu behavior.
+After installation, the project folder can be deleted because the runtime
+scripts are deployed to a stable per-user location.
 
-It uses `ffmpeg` to change display rotation metadata only. It does not re-encode the video.
+## Quick Start
 
-## Files
+Install:
+
+```powershell
+powershell -NoLogo -NoProfile -ExecutionPolicy Bypass `
+  -File .\install-video-rotate-context-menu.ps1
+```
+
+Install with a fixed `ffmpeg.exe` path:
+
+```powershell
+powershell -NoLogo -NoProfile -ExecutionPolicy Bypass `
+  -File .\install-video-rotate-context-menu.ps1 `
+  -FfmpegPath "C:\path\to\ffmpeg.exe"
+```
+
+Uninstall:
+
+```powershell
+powershell -NoLogo -NoProfile -ExecutionPolicy Bypass `
+  -File .\uninstall-video-rotate-context-menu.ps1
+```
+
+## Repository Layout
 
 - `install-video-rotate-context-menu.ps1`
+  Registers Explorer context-menu entries under `HKCU`.
 - `invoke-video-display-rotation.ps1`
+  Executes `ffmpeg` and writes rotation metadata to a new output file.
 - `uninstall-video-rotate-context-menu.ps1`
+  Removes installed registry entries.
+- `docs/IMPLEMENTATION.md`
+  Architecture, execution model, compatibility decisions, and design details.
+- `docs/TROUBLESHOOTING.md`
+  Validation commands, failure symptoms, diagnostics, and maintenance checks.
 
-Keep these files in the same folder after you copy them to another computer.
+## Runtime Note
 
-## Install
+During installation, the runtime scripts are copied to:
 
-If `ffmpeg.exe` is already available in `PATH` or already lives in a common install location, run:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install-video-rotate-context-menu.ps1
+```text
+%LOCALAPPDATA%\VideoRotateContextMenu
 ```
 
-The installer will try to find `ffmpeg.exe` immediately and pin the resolved path into the menu command when it can.
+The installed context-menu command then points to that deployed helper script by
+absolute path. It does not resolve the helper from the current working
+directory at click time.
 
-If `ffmpeg.exe` is not in `PATH`, pin its full path during install:
+This means the project folder is not required after installation. If you want to
+change the deployment location, re-run the install script with `-DeploymentRoot`.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\install-video-rotate-context-menu.ps1 -FfmpegPath "D:\ffmpeg\bin\ffmpeg.exe"
-```
+## Additional Documentation
 
-The menu is installed per-user under `HKCU`, so administrator rights are not required.
-
-If install cannot find `ffmpeg.exe`, it still installs the menu and prints a warning. In that case the helper script will keep trying `PATH` and the common locations listed below each time you click the menu, so installing `ffmpeg` later can still make the existing menu work.
-
-## Use
-
-1. Right-click a supported video file such as `.mp4`, `.mkv`, `.mov`, `.avi`, `.wmv`, `.webm`.
-2. Open the installed rotation menu.
-3. Choose the desired rotation.
-
-On Windows 11, the menu may appear under `Show more options`.
-
-## Output behavior
-
-- Default output is a new file in the same folder.
-- Example: `input.mp4` becomes `input.display-rot90.mp4`.
-- Rotation values follow ffmpeg display metadata behavior:
-  - `90` = counterclockwise 90 degrees
-  - `180` = rotate 180 degrees
-  - `270` = clockwise 90 degrees
-  - `0` = clear rotation metadata
-
-## How ffmpeg is found
-
-If install was run without `-FfmpegPath`, the installer first tries to find `ffmpeg.exe` and pin the exact path. If nothing is found during install, the helper script tries these in order when you click the menu:
-
-1. `ffmpeg.exe` from `PATH`
-2. `%ProgramFiles%\ffmpeg\bin\ffmpeg.exe`
-3. `%ProgramFiles%\FFmpeg\bin\ffmpeg.exe`
-4. `%USERPROFILE%\scoop\apps\ffmpeg\current\bin\ffmpeg.exe`
-5. `%SystemDrive%\ffmpeg\bin\ffmpeg.exe`
-6. `%ChocolateyInstall%\bin\ffmpeg.exe` if Chocolatey exists
-
-If install was run with `-FfmpegPath`, that exact path is stored into the menu command and used directly.
-
-## Uninstall
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\uninstall-video-rotate-context-menu.ps1
-```
+- [Implementation](docs/IMPLEMENTATION.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)

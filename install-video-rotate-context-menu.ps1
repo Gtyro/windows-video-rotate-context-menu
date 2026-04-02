@@ -1,12 +1,13 @@
 param(
   [string]$FfmpegPath = "",
   [string]$MenuText = "",
-  [switch]$IncludeReset = $true
+  [switch]$IncludeReset = $true,
+  [string]$DeploymentRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-function New-Text {
+function ConvertFrom-CodePoints {
   param(
     [int[]]$CodePoints
   )
@@ -14,108 +15,15 @@ function New-Text {
   return (-join ($CodePoints | ForEach-Object { [char]$_ }))
 }
 
-function Find-FfmpegPath {
-  try {
-    return (Get-Command ffmpeg.exe -ErrorAction Stop).Source
-  } catch {
-  }
-
-  $commonCandidates = @(
-    (Join-Path $env:ProgramFiles "ffmpeg\bin\ffmpeg.exe"),
-    (Join-Path $env:ProgramFiles "FFmpeg\bin\ffmpeg.exe"),
-    (Join-Path $env:USERPROFILE "scoop\apps\ffmpeg\current\bin\ffmpeg.exe"),
-    (Join-Path $env:SystemDrive "ffmpeg\bin\ffmpeg.exe")
-  )
-
-  if ($env:ChocolateyInstall) {
-    $commonCandidates += (Join-Path $env:ChocolateyInstall "bin\ffmpeg.exe")
-  }
-
-  foreach ($item in $commonCandidates) {
-    if (-not [string]::IsNullOrWhiteSpace($item) -and (Test-Path -LiteralPath $item)) {
-      return (Resolve-Path -LiteralPath $item).Path
-    }
-  }
-
-  return ""
-}
-
-function Get-InstallRoot {
-  $basePath = $env:LOCALAPPDATA
-  if ([string]::IsNullOrWhiteSpace($basePath)) {
-    $basePath = [Environment]::GetFolderPath("LocalApplicationData")
-  }
-
-  if ([string]::IsNullOrWhiteSpace($basePath)) {
-    throw "LocalApplicationData could not be resolved."
-  }
-
-  return (Join-Path $basePath "VideoRotateContextMenu")
-}
-
-function Copy-InstalledFile {
+function Set-RegistryStringValue {
   param(
-    [Parameter(Mandatory)]
-    [string]$SourcePath,
-
-    [Parameter(Mandatory)]
-    [string]$DestinationPath
+    [Microsoft.Win32.RegistryKey]$Key,
+    [string]$Name,
+    [string]$Value
   )
 
-  $resolvedSourcePath = (Resolve-Path -LiteralPath $SourcePath).Path
-  $destinationParent = Split-Path -Parent $DestinationPath
-  if (-not [string]::IsNullOrWhiteSpace($destinationParent) -and -not (Test-Path -LiteralPath $destinationParent)) {
-    New-Item -ItemType Directory -Path $destinationParent -Force | Out-Null
-  }
-
-  if ((Test-Path -LiteralPath $DestinationPath) -and ((Resolve-Path -LiteralPath $DestinationPath).Path -eq $resolvedSourcePath)) {
-    return $resolvedSourcePath
-  }
-
-  Copy-Item -LiteralPath $resolvedSourcePath -Destination $DestinationPath -Force
-  return (Resolve-Path -LiteralPath $DestinationPath).Path
+  $Key.SetValue($Name, $Value, [Microsoft.Win32.RegistryValueKind]::String)
 }
-
-if ([string]::IsNullOrWhiteSpace($MenuText)) {
-  $MenuText = New-Text -CodePoints @(0x65CB, 0x8F6C, 0x89C6, 0x9891)
-}
-
-$scriptRoot = Split-Path -Parent $PSCommandPath
-$invokeScriptPath = Join-Path $scriptRoot "invoke-video-display-rotation.ps1"
-$uninstallScriptPath = Join-Path $scriptRoot "uninstall-video-rotate-context-menu.ps1"
-
-if (-not (Test-Path -LiteralPath $invokeScriptPath)) {
-  throw "Missing helper script: $invokeScriptPath"
-}
-
-if (-not (Test-Path -LiteralPath $uninstallScriptPath)) {
-  throw "Missing uninstall script: $uninstallScriptPath"
-}
-
-$installRoot = Get-InstallRoot
-$resolvedInvokeScriptPath = Copy-InstalledFile -SourcePath $invokeScriptPath -DestinationPath (Join-Path $installRoot "invoke-video-display-rotation.ps1")
-$resolvedUninstallScriptPath = Copy-InstalledFile -SourcePath $uninstallScriptPath -DestinationPath (Join-Path $installRoot "uninstall-video-rotate-context-menu.ps1")
-$pinnedFfmpegPath = ""
-$detectedFfmpegPath = ""
-$ffmpegPathSource = "runtime"
-
-if (-not [string]::IsNullOrWhiteSpace($FfmpegPath)) {
-  if (-not (Test-Path -LiteralPath $FfmpegPath)) {
-    throw "Specified ffmpeg was not found: $FfmpegPath"
-  }
-
-  $pinnedFfmpegPath = (Resolve-Path -LiteralPath $FfmpegPath).Path
-  $detectedFfmpegPath = $pinnedFfmpegPath
-  $ffmpegPathSource = "explicit"
-} else {
-  $autoDetectedFfmpegPath = Find-FfmpegPath
-  if (-not [string]::IsNullOrWhiteSpace($autoDetectedFfmpegPath)) {
-    $detectedFfmpegPath = $autoDetectedFfmpegPath
-    $ffmpegPathSource = "auto-detected"
-  }
-}
-
-$powerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 
 function Get-VideoExtensions {
   return @(
@@ -124,53 +32,111 @@ function Get-VideoExtensions {
   )
 }
 
-function Get-ExtensionProgId {
-  param(
-    [Parameter(Mandatory)]
-    [string]$Extension
-  )
-
-  $userChoiceKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
-    "Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$Extension\UserChoice"
-  )
-  if ($userChoiceKey) {
-    try {
-      $userChoiceProgId = $userChoiceKey.GetValue("ProgId", "")
-      if (-not [string]::IsNullOrWhiteSpace($userChoiceProgId)) {
-        return $userChoiceProgId
-      }
-    } finally {
-      $userChoiceKey.Close()
-    }
-  }
-
-  $extensionKey = [Microsoft.Win32.Registry]::ClassesRoot.OpenSubKey($Extension)
-  if ($extensionKey) {
-    try {
-      $defaultProgId = $extensionKey.GetValue("", "")
-      if (-not [string]::IsNullOrWhiteSpace($defaultProgId)) {
-        return $defaultProgId
-      }
-
-      $openWithProgIdsKey = $extensionKey.OpenSubKey("OpenWithProgids")
-      if ($openWithProgIdsKey) {
-        try {
-          foreach ($name in $openWithProgIdsKey.GetValueNames()) {
-            if (-not [string]::IsNullOrWhiteSpace($name)) {
-              return $name
-            }
-          }
-        } finally {
-          $openWithProgIdsKey.Close()
-        }
-      }
-    } finally {
-      $extensionKey.Close()
-    }
-  }
-
-  return ""
+function Get-StateSubKeyPath {
+  return "Software\VideoRotateContextMenu"
 }
+
+function Resolve-DeploymentRoot {
+  param(
+    [string]$Candidate
+  )
+
+  if (-not [string]::IsNullOrWhiteSpace($Candidate)) {
+    return [System.IO.Path]::GetFullPath($Candidate)
+  }
+
+  if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    throw "LOCALAPPDATA is not available. Pass -DeploymentRoot explicitly."
+  }
+
+  return (Join-Path $env:LOCALAPPDATA "VideoRotateContextMenu")
+}
+
+function Copy-DeploymentFiles {
+  param(
+    [string]$SourceRoot,
+    [string]$DestinationRoot
+  )
+
+  if (-not (Test-Path -LiteralPath $SourceRoot)) {
+    throw "Source root does not exist: $SourceRoot"
+  }
+
+  New-Item -ItemType Directory -Path $DestinationRoot -Force | Out-Null
+
+  $runtimeFiles = @(
+    "invoke-video-display-rotation.ps1",
+    "uninstall-video-rotate-context-menu.ps1"
+  )
+
+  foreach ($fileName in $runtimeFiles) {
+    $sourcePath = Join-Path $SourceRoot $fileName
+    if (-not (Test-Path -LiteralPath $sourcePath)) {
+      throw "Missing runtime file: $sourcePath"
+    }
+
+    $destinationPath = Join-Path $DestinationRoot $fileName
+    Copy-Item -LiteralPath $sourcePath -Destination $destinationPath -Force
+  }
+}
+
+function Write-InstallState {
+  param(
+    [string]$DeploymentRootPath,
+    [string]$InvokeScriptPath,
+    [string]$UninstallScriptPath,
+    [string]$PinnedFfmpegPath
+  )
+
+  $stateKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey((Get-StateSubKeyPath))
+  if (-not $stateKey) {
+    throw "Failed to create registry key: HKCU\$(Get-StateSubKeyPath)"
+  }
+
+  try {
+    Set-RegistryStringValue -Key $stateKey -Name "DeploymentRoot" -Value $DeploymentRootPath
+    Set-RegistryStringValue -Key $stateKey -Name "InvokeScriptPath" -Value $InvokeScriptPath
+    Set-RegistryStringValue -Key $stateKey -Name "UninstallScriptPath" -Value $UninstallScriptPath
+    Set-RegistryStringValue -Key $stateKey -Name "FfmpegPath" -Value $PinnedFfmpegPath
+    Set-RegistryStringValue -Key $stateKey -Name "InstalledAtUtc" -Value ([DateTime]::UtcNow.ToString("o"))
+  } finally {
+    $stateKey.Close()
+  }
+}
+
+$defaultMenuText = ConvertFrom-CodePoints @(0x65CB, 0x8F6C, 0x89C6, 0x9891)
+if ([string]::IsNullOrWhiteSpace($MenuText)) {
+  $MenuText = $defaultMenuText
+}
+
+$sourceScriptRoot = Split-Path -Parent $PSCommandPath
+$sourceInvokeScriptPath = Join-Path $sourceScriptRoot "invoke-video-display-rotation.ps1"
+$sourceUninstallScriptPath = Join-Path $sourceScriptRoot "uninstall-video-rotate-context-menu.ps1"
+
+if (-not (Test-Path -LiteralPath $sourceInvokeScriptPath)) {
+  throw "Missing helper script: $sourceInvokeScriptPath"
+}
+
+if (-not (Test-Path -LiteralPath $sourceUninstallScriptPath)) {
+  throw "Missing uninstall script: $sourceUninstallScriptPath"
+}
+
+$resolvedDeploymentRoot = Resolve-DeploymentRoot -Candidate $DeploymentRoot
+Copy-DeploymentFiles -SourceRoot $sourceScriptRoot -DestinationRoot $resolvedDeploymentRoot
+
+$resolvedInvokeScriptPath = (Resolve-Path -LiteralPath (Join-Path $resolvedDeploymentRoot "invoke-video-display-rotation.ps1")).Path
+$resolvedDeployedUninstallScriptPath = (Resolve-Path -LiteralPath (Join-Path $resolvedDeploymentRoot "uninstall-video-rotate-context-menu.ps1")).Path
+$resolvedFfmpegPath = ""
+
+if (-not [string]::IsNullOrWhiteSpace($FfmpegPath)) {
+  if (-not (Test-Path -LiteralPath $FfmpegPath)) {
+    throw "Specified ffmpeg was not found: $FfmpegPath"
+  }
+
+  $resolvedFfmpegPath = (Resolve-Path -LiteralPath $FfmpegPath).Path
+}
+
+$powerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
 
 function New-VerbCommand {
   param(
@@ -187,99 +153,50 @@ function New-VerbCommand {
     "-Rotation", $Rotation.ToString()
   )
 
-  if (-not [string]::IsNullOrWhiteSpace($pinnedFfmpegPath)) {
-    $parts += @("-FfmpegPath", '"' + $pinnedFfmpegPath + '"')
+  if (-not [string]::IsNullOrWhiteSpace($resolvedFfmpegPath)) {
+    $parts += @("-FfmpegPath", '"' + $resolvedFfmpegPath + '"')
   }
 
   return ($parts -join " ")
 }
 
-function Set-RegistryStringValue {
-  param(
-    [Microsoft.Win32.RegistryKey]$Key,
-    [string]$Name,
-    [string]$Value
-  )
-
-  $Key.SetValue($Name, $Value, [Microsoft.Win32.RegistryValueKind]::String)
-}
-
-function Set-RegistryDWordValue {
-  param(
-    [Microsoft.Win32.RegistryKey]$Key,
-    [string]$Name,
-    [int]$Value
-  )
-
-  $Key.SetValue($Name, $Value, [Microsoft.Win32.RegistryValueKind]::DWord)
-}
-
-function Refresh-ShellAssociations {
-  if (-not ("Win32.NativeMethods" -as [type])) {
-    Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition @"
-[System.Runtime.InteropServices.DllImport("shell32.dll")]
-public static extern void SHChangeNotify(int wEventId, uint uFlags, System.IntPtr dwItem1, System.IntPtr dwItem2);
-"@
-  }
-
-  [Win32.NativeMethods]::SHChangeNotify(0x08000000, 0x0000, [IntPtr]::Zero, [IntPtr]::Zero)
-}
-
-function Get-HkcrRelativePath {
-  param(
-    [Parameter(Mandatory)]
-    [string]$SubKeyPath
-  )
-
-  $prefix = "Software\Classes\"
-  if ($SubKeyPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-    return $SubKeyPath.Substring($prefix.Length)
-  }
-
-  return $SubKeyPath
-}
-
 function Install-MenuAtSubKey {
   param(
     [string]$SubKeyPath,
-    [hashtable[]]$Entries
+    [string]$AppliesTo = ""
   )
 
-  $menuKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($SubKeyPath)
-  if (-not $menuKey) {
+  $baseKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($SubKeyPath)
+  if (-not $baseKey) {
     throw "Failed to create registry key: HKCU\$SubKeyPath"
   }
 
   try {
-    $menuKey.DeleteValue("", $false)
-    Set-RegistryStringValue -Key $menuKey -Name "MUIVerb" -Value $MenuText
-    Set-RegistryStringValue -Key $menuKey -Name "Icon" -Value "%SystemRoot%\System32\shell32.dll,133"
-    Set-RegistryStringValue -Key $menuKey -Name "ExtendedSubCommandsKey" -Value (Get-HkcrRelativePath -SubKeyPath $SubKeyPath)
-    Set-RegistryStringValue -Key $menuKey -Name "MultiSelectModel" -Value "Player"
-    $menuKey.DeleteValue("SubCommands", $false)
-    $menuKey.DeleteValue("CommandFlags", $false)
+    Set-RegistryStringValue -Key $baseKey -Name "" -Value ""
+    Set-RegistryStringValue -Key $baseKey -Name "MUIVerb" -Value $MenuText
+    Set-RegistryStringValue -Key $baseKey -Name "SubCommands" -Value ""
+    Set-RegistryStringValue -Key $baseKey -Name "Icon" -Value "%SystemRoot%\System32\shell32.dll,133"
+
+    if (-not [string]::IsNullOrWhiteSpace($AppliesTo)) {
+      Set-RegistryStringValue -Key $baseKey -Name "AppliesTo" -Value $AppliesTo
+    } else {
+      $baseKey.DeleteValue("AppliesTo", $false)
+    }
   } finally {
-    $menuKey.Close()
+    $baseKey.Close()
   }
 
-  foreach ($entry in $Entries) {
-    $verbKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$SubKeyPath\shell\$($entry.Name)")
-    if (-not $verbKey) {
+  foreach ($entry in $menuEntries) {
+    $entryKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$SubKeyPath\shell\$($entry.Name)")
+    if (-not $entryKey) {
       throw "Failed to create registry key: HKCU\$SubKeyPath\shell\$($entry.Name)"
     }
 
     try {
-      $verbKey.DeleteValue("", $false)
-      Set-RegistryStringValue -Key $verbKey -Name "MUIVerb" -Value $entry.Label
-      Set-RegistryStringValue -Key $verbKey -Name "Icon" -Value "%SystemRoot%\System32\shell32.dll,133"
-
-      if ($entry.ContainsKey("CommandFlags")) {
-        Set-RegistryDWordValue -Key $verbKey -Name "CommandFlags" -Value $entry.CommandFlags
-      } else {
-        $verbKey.DeleteValue("CommandFlags", $false)
-      }
+      Set-RegistryStringValue -Key $entryKey -Name "MUIVerb" -Value $entry.Label
+      Set-RegistryStringValue -Key $entryKey -Name "Icon" -Value "%SystemRoot%\System32\shell32.dll,133"
     } finally {
-      $verbKey.Close()
+      $entryKey.Close()
     }
 
     $commandKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey("$SubKeyPath\shell\$($entry.Name)\command")
@@ -296,72 +213,50 @@ function Install-MenuAtSubKey {
 }
 
 $menuEntries = @(
-  @{
-    Name = "Rotate90CCW"
-    Label = (New-Text -CodePoints @(0x9006, 0x65F6, 0x9488)) + " 90" + [char]0x00B0
-    Rotation = 90
-  },
-  @{
-    Name = "Rotate180"
-    Label = (New-Text -CodePoints @(0x65CB, 0x8F6C)) + " 180" + [char]0x00B0
-    Rotation = 180
-  },
-  @{
-    Name = "Rotate90CW"
-    Label = (New-Text -CodePoints @(0x987A, 0x65F6, 0x9488)) + " 90" + [char]0x00B0
-    Rotation = 270
-  }
+  [pscustomobject]@{ Name = "Rotate90CCW"; Label = (ConvertFrom-CodePoints @(0x9006, 0x65F6, 0x9488, 0x0020, 0x0039, 0x0030, 0x00B0)); Rotation = 90 },
+  [pscustomobject]@{ Name = "Rotate180"; Label = (ConvertFrom-CodePoints @(0x65CB, 0x8F6C, 0x0020, 0x0031, 0x0038, 0x0030, 0x00B0)); Rotation = 180 },
+  [pscustomobject]@{ Name = "Rotate90CW"; Label = (ConvertFrom-CodePoints @(0x987A, 0x65F6, 0x9488, 0x0020, 0x0039, 0x0030, 0x00B0)); Rotation = 270 }
 )
 
 if ($IncludeReset) {
-  $menuEntries += @{
-    Name = "Rotate0"
-    Label = (New-Text -CodePoints @(0x6E05, 0x9664, 0x65CB, 0x8F6C, 0x6807, 0x8BB0)) + " (0" + [char]0x00B0 + ")"
-    Rotation = 0
+  $menuEntries += [pscustomobject]@{ Name = "Rotate0"; Label = (ConvertFrom-CodePoints @(0x6E05, 0x9664, 0x65CB, 0x8F6C, 0x6807, 0x8BB0, 0x0020, 0x0028, 0x0030, 0x00B0, 0x0029)); Rotation = 0 }
+}
+
+$targetSubKeys = @()
+
+foreach ($extension in Get-VideoExtensions) {
+  $targetSubKeys += [pscustomobject]@{
+    Path = "Software\Classes\SystemFileAssociations\$extension\shell\RotateVideoDisplayMetadata"
+    AppliesTo = ""
   }
 }
 
-$targetMenuKeys = foreach ($extension in Get-VideoExtensions | Sort-Object -Unique) {
-  $progId = Get-ExtensionProgId -Extension $extension
-
-  if ([string]::IsNullOrWhiteSpace($progId)) {
-    Write-Warning "No ProgID was found for $extension. Skipping this extension."
-    continue
-  }
-
-  [pscustomobject]@{
-    Path = "Software\Classes\$progId\shell\RotateVideoDisplayMetadata"
-    Extension = $extension
-    ProgId = $progId
-  }
+foreach ($target in $targetSubKeys | Sort-Object Path -Unique) {
+  Install-MenuAtSubKey -SubKeyPath $target.Path -AppliesTo $target.AppliesTo
 }
 
-foreach ($target in $targetMenuKeys | Sort-Object Path -Unique) {
-  Install-MenuAtSubKey -SubKeyPath $target.Path -Entries $menuEntries
-}
-
-Refresh-ShellAssociations
+Write-InstallState `
+  -DeploymentRootPath $resolvedDeploymentRoot `
+  -InvokeScriptPath $resolvedInvokeScriptPath `
+  -UninstallScriptPath $resolvedDeployedUninstallScriptPath `
+  -PinnedFfmpegPath $resolvedFfmpegPath
 
 Write-Output "Installed per-user menu entries:"
-foreach ($target in $targetMenuKeys | Sort-Object Path -Unique) {
-  Write-Output "  HKCU\\$($target.Path) [$($target.Extension)]"
+foreach ($target in $targetSubKeys | Sort-Object Path -Unique) {
+  Write-Output "  HKCU\\$($target.Path)"
 }
-Write-Output "Installed runtime files: $installRoot"
-Write-Output "Installed helper script: $resolvedInvokeScriptPath"
-Write-Output "Installed uninstall script: $resolvedUninstallScriptPath"
-Write-Output "To uninstall later, run:"
-Write-Output "  powershell -ExecutionPolicy Bypass -File `"$resolvedUninstallScriptPath`""
 
-switch ($ffmpegPathSource) {
-  "explicit" {
-    Write-Output "Pinned ffmpeg path: $pinnedFfmpegPath"
-  }
-  "auto-detected" {
-    Write-Output "Detected ffmpeg during install: $detectedFfmpegPath"
-    Write-Output "ffmpeg path was intentionally left unpinned so the runtime script can resolve it dynamically."
-  }
-  default {
-    Write-Warning "ffmpeg.exe was not found during install. The menu was installed, but it will not work until ffmpeg is available on PATH or in a common install location, or until you reinstall with -FfmpegPath."
-    Write-Output "ffmpeg path not pinned. The helper script will look in PATH/common locations at runtime."
-  }
+Write-Output "Deployment root: $resolvedDeploymentRoot"
+Write-Output "Helper script: $resolvedInvokeScriptPath"
+Write-Output "Uninstall script: $resolvedDeployedUninstallScriptPath"
+Write-Output "The project folder is no longer required after installation."
+
+if ([string]::IsNullOrWhiteSpace($resolvedFfmpegPath)) {
+  Write-Output "ffmpeg path not pinned. The helper script will look in PATH/common locations at runtime."
+} else {
+  Write-Output "Pinned ffmpeg path: $resolvedFfmpegPath"
+}
+
+if ([Environment]::OSVersion.Version.Build -ge 22000) {
+  Write-Output 'Windows 11 note: this menu uses the classic shell verb model and usually appears under "Show more options" (Shift+F10).'
 }

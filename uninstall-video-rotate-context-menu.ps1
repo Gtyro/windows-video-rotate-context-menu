@@ -9,84 +9,152 @@ function Get-VideoExtensions {
   )
 }
 
-function Get-ExtensionProgId {
+function Get-StateSubKeyPath {
+  return "Software\VideoRotateContextMenu"
+}
+
+function Get-DefaultDeploymentRoot {
+  if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    return ""
+  }
+
+  return (Join-Path $env:LOCALAPPDATA "VideoRotateContextMenu")
+}
+
+function Get-InstallState {
+  $stateKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey((Get-StateSubKeyPath))
+  if (-not $stateKey) {
+    return $null
+  }
+
+  try {
+    return [pscustomobject]@{
+      DeploymentRoot = [string]$stateKey.GetValue("DeploymentRoot", "")
+      InvokeScriptPath = [string]$stateKey.GetValue("InvokeScriptPath", "")
+      UninstallScriptPath = [string]$stateKey.GetValue("UninstallScriptPath", "")
+    }
+  } finally {
+    $stateKey.Close()
+  }
+}
+
+function Remove-InstallState {
+  $statePath = Get-StateSubKeyPath
+  $existingKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($statePath)
+  if ($existingKey) {
+    $existingKey.Close()
+    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($statePath, $false)
+    Write-Output "Removed: HKCU\\$statePath"
+  }
+}
+
+function Test-IsWithinPath {
   param(
-    [Parameter(Mandatory)]
-    [string]$Extension
+    [string]$ParentPath,
+    [string]$ChildPath
   )
 
-  $userChoiceKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(
-    "Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\$Extension\UserChoice"
+  if ([string]::IsNullOrWhiteSpace($ParentPath) -or [string]::IsNullOrWhiteSpace($ChildPath)) {
+    return $false
+  }
+
+  $resolvedParentPath = [System.IO.Path]::GetFullPath($ParentPath).TrimEnd('\')
+  $resolvedChildPath = [System.IO.Path]::GetFullPath($ChildPath)
+
+  return (
+    $resolvedChildPath.Equals($resolvedParentPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+    $resolvedChildPath.StartsWith($resolvedParentPath + "\", [System.StringComparison]::OrdinalIgnoreCase)
   )
-  if ($userChoiceKey) {
-    try {
-      $userChoiceProgId = $userChoiceKey.GetValue("ProgId", "")
-      if (-not [string]::IsNullOrWhiteSpace($userChoiceProgId)) {
-        return $userChoiceProgId
-      }
-    } finally {
-      $userChoiceKey.Close()
+}
+
+function Start-DeferredDeploymentCleanup {
+  param(
+    [string]$DeploymentRootPath
+  )
+
+  $cleanupScriptPath = Join-Path $env:TEMP ("video-rotate-context-menu-cleanup-{0}.ps1" -f [guid]::NewGuid().ToString("N"))
+  $cleanupScriptContent = @(
+    'param(',
+    '  [Parameter(Mandatory)]',
+    '  [string]$TargetPath,',
+    '  [Parameter(Mandatory)]',
+    '  [string]$SelfPath',
+    ')',
+    '$ErrorActionPreference = "SilentlyContinue"',
+    'Start-Sleep -Seconds 2',
+    'if (Test-Path -LiteralPath $TargetPath) {',
+    '  Remove-Item -LiteralPath $TargetPath -Recurse -Force',
+    '}',
+    'if (Test-Path -LiteralPath $SelfPath) {',
+    '  Remove-Item -LiteralPath $SelfPath -Force',
+    '}'
+  )
+
+  Set-Content -LiteralPath $cleanupScriptPath -Value $cleanupScriptContent -Encoding Ascii
+
+  $powerShellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+  Start-Process `
+    -FilePath $powerShellExe `
+    -ArgumentList @(
+      "-NoLogo",
+      "-NoProfile",
+      "-ExecutionPolicy", "Bypass",
+      "-File", $cleanupScriptPath,
+      "-TargetPath", $DeploymentRootPath,
+      "-SelfPath", $cleanupScriptPath
+    ) `
+    -WindowStyle Hidden | Out-Null
+}
+
+function Remove-DeploymentRoot {
+  param(
+    [string]$DeploymentRootPath
+  )
+
+  if ([string]::IsNullOrWhiteSpace($DeploymentRootPath)) {
+    return
+  }
+
+  if (-not (Test-Path -LiteralPath $DeploymentRootPath)) {
+    return
+  }
+
+  $resolvedDeploymentRootPath = [System.IO.Path]::GetFullPath($DeploymentRootPath)
+  $expectedFiles = @(
+    (Join-Path $resolvedDeploymentRootPath "invoke-video-display-rotation.ps1"),
+    (Join-Path $resolvedDeploymentRootPath "uninstall-video-rotate-context-menu.ps1")
+  )
+
+  $containsExpectedFiles = $false
+  foreach ($expectedFile in $expectedFiles) {
+    if (Test-Path -LiteralPath $expectedFile) {
+      $containsExpectedFiles = $true
+      break
     }
   }
 
-  $extensionKey = [Microsoft.Win32.Registry]::ClassesRoot.OpenSubKey($Extension)
-  if ($extensionKey) {
-    try {
-      $defaultProgId = $extensionKey.GetValue("", "")
-      if (-not [string]::IsNullOrWhiteSpace($defaultProgId)) {
-        return $defaultProgId
-      }
-
-      $openWithProgIdsKey = $extensionKey.OpenSubKey("OpenWithProgids")
-      if ($openWithProgIdsKey) {
-        try {
-          foreach ($name in $openWithProgIdsKey.GetValueNames()) {
-            if (-not [string]::IsNullOrWhiteSpace($name)) {
-              return $name
-            }
-          }
-        } finally {
-          $openWithProgIdsKey.Close()
-        }
-      }
-    } finally {
-      $extensionKey.Close()
-    }
+  if (-not $containsExpectedFiles) {
+    Write-Warning "Skipping deployment directory cleanup because expected runtime files were not found: $resolvedDeploymentRootPath"
+    return
   }
 
-  return ""
-}
-
-function Get-InstallRoot {
-  $basePath = $env:LOCALAPPDATA
-  if ([string]::IsNullOrWhiteSpace($basePath)) {
-    $basePath = [Environment]::GetFolderPath("LocalApplicationData")
+  $currentScriptPath = ""
+  if (-not [string]::IsNullOrWhiteSpace($PSCommandPath) -and (Test-Path -LiteralPath $PSCommandPath)) {
+    $currentScriptPath = [System.IO.Path]::GetFullPath($PSCommandPath)
   }
 
-  if ([string]::IsNullOrWhiteSpace($basePath)) {
-    throw "LocalApplicationData could not be resolved."
+  if (Test-IsWithinPath -ParentPath $resolvedDeploymentRootPath -ChildPath $currentScriptPath) {
+    Start-DeferredDeploymentCleanup -DeploymentRootPath $resolvedDeploymentRootPath
+    Write-Output "Scheduled deployment directory cleanup: $resolvedDeploymentRootPath"
+    return
   }
 
-  return (Join-Path $basePath "VideoRotateContextMenu")
-}
-
-function Refresh-ShellAssociations {
-  if (-not ("Win32.NativeMethods" -as [type])) {
-    Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition @"
-[System.Runtime.InteropServices.DllImport("shell32.dll")]
-public static extern void SHChangeNotify(int wEventId, uint uFlags, System.IntPtr dwItem1, System.IntPtr dwItem2);
-"@
-  }
-
-  [Win32.NativeMethods]::SHChangeNotify(0x08000000, 0x0000, [IntPtr]::Zero, [IntPtr]::Zero)
+  Remove-Item -LiteralPath $resolvedDeploymentRootPath -Recurse -Force
+  Write-Output "Removed deployment directory: $resolvedDeploymentRootPath"
 }
 
 $menuKeyNames = @(
   "RotateVideoDisplayMetadata",
-  "RotateVideoDisplayMetadata10Rotate90CCW",
-  "RotateVideoDisplayMetadata20Rotate180",
-  "RotateVideoDisplayMetadata30Rotate90CW",
-  "RotateVideoDisplayMetadata40Rotate0",
   "RotateVideoTest"
 )
 
@@ -103,15 +171,6 @@ foreach ($menuKeyName in $menuKeyNames) {
   $subKeys += "Software\Classes\SystemFileAssociations\video\shell\$menuKeyName"
 }
 
-foreach ($extension in Get-VideoExtensions) {
-  $progId = Get-ExtensionProgId -Extension $extension
-  if (-not [string]::IsNullOrWhiteSpace($progId)) {
-    foreach ($menuKeyName in $menuKeyNames) {
-      $subKeys += "Software\Classes\$progId\shell\$menuKeyName"
-    }
-  }
-}
-
 foreach ($subKey in $subKeys | Sort-Object -Unique) {
   $existingKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subKey)
   if ($existingKey) {
@@ -121,45 +180,14 @@ foreach ($subKey in $subKeys | Sort-Object -Unique) {
   }
 }
 
-$installRoot = Get-InstallRoot
-$installedInvokeScriptPath = Join-Path $installRoot "invoke-video-display-rotation.ps1"
-$installedUninstallScriptPath = Join-Path $installRoot "uninstall-video-rotate-context-menu.ps1"
-$currentScriptPath = ""
+$installState = Get-InstallState
+$deploymentRoot = ""
 
-if ($PSCommandPath) {
-  try {
-    $currentScriptPath = (Resolve-Path -LiteralPath $PSCommandPath).Path
-  } catch {
-    $currentScriptPath = $PSCommandPath
-  }
+if ($installState -and -not [string]::IsNullOrWhiteSpace($installState.DeploymentRoot)) {
+  $deploymentRoot = $installState.DeploymentRoot
+} else {
+  $deploymentRoot = Get-DefaultDeploymentRoot
 }
 
-if (Test-Path -LiteralPath $installedInvokeScriptPath) {
-  Remove-Item -LiteralPath $installedInvokeScriptPath -Force -ErrorAction SilentlyContinue
-  Write-Output "Removed installed helper script: $installedInvokeScriptPath"
-}
-
-if (
-  (Test-Path -LiteralPath $installedUninstallScriptPath) -and
-  ($currentScriptPath -ne (Resolve-Path -LiteralPath $installedUninstallScriptPath).Path)
-) {
-  Remove-Item -LiteralPath $installedUninstallScriptPath -Force -ErrorAction SilentlyContinue
-  Write-Output "Removed installed uninstall script: $installedUninstallScriptPath"
-}
-
-if (Test-Path -LiteralPath $installRoot) {
-  try {
-    $remainingItems = @(Get-ChildItem -LiteralPath $installRoot -Force)
-  } catch {
-    $remainingItems = @()
-  }
-
-  if ($remainingItems.Count -eq 0) {
-    Remove-Item -LiteralPath $installRoot -Force -ErrorAction SilentlyContinue
-    Write-Output "Removed install directory: $installRoot"
-  } else {
-    Write-Output "Install directory retained: $installRoot"
-  }
-}
-
-Refresh-ShellAssociations
+Remove-InstallState
+Remove-DeploymentRoot -DeploymentRootPath $deploymentRoot

@@ -13,74 +13,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-function Looks-LikeExecutablePath {
-  param(
-    [string]$Path
-  )
-
-  return (
-    -not [string]::IsNullOrWhiteSpace($Path) -and
-    [System.IO.Path]::IsPathRooted($Path) -and
-    [System.IO.Path]::GetExtension($Path).Equals(".exe", [System.StringComparison]::OrdinalIgnoreCase)
-  )
-}
-
-function Read-TextFileSafely {
-  param(
-    [string]$Path
-  )
-
-  if ([string]::IsNullOrWhiteSpace($Path)) {
-    return ""
-  }
-
-  try {
-    if (Test-Path -LiteralPath $Path) {
-      return ((Get-Content -LiteralPath $Path -Raw) -as [string]).Trim()
-    }
-  } catch {
-  }
-
-  return ""
-}
-
-function Show-ErrorDialog {
-  param(
-    [string]$Message
-  )
-
-  try {
-    $shell = New-Object -ComObject WScript.Shell
-    $null = $shell.Popup($Message, 0, "Video Rotate", 16)
-  } catch {
-  }
-}
-
 function Resolve-FfmpegPath {
   param(
     [string]$Candidate
   )
 
   if (-not [string]::IsNullOrWhiteSpace($Candidate)) {
-    try {
-      if (Test-Path -LiteralPath $Candidate -PathType Leaf) {
-        try {
-          return (Resolve-Path -LiteralPath $Candidate).Path
-        } catch {
-          return $Candidate
-        }
-      }
-    } catch [System.UnauthorizedAccessException] {
-      if (Looks-LikeExecutablePath -Path $Candidate) {
-        return $Candidate
-      }
-    } catch {
-      if (Looks-LikeExecutablePath -Path $Candidate) {
-        return $Candidate
-      }
+    if (-not (Test-Path -LiteralPath $Candidate)) {
+      throw "Specified ffmpeg was not found: $Candidate"
     }
 
-    throw "Specified ffmpeg was not found: $Candidate"
+    return (Resolve-Path -LiteralPath $Candidate).Path
   }
 
   try {
@@ -99,43 +42,9 @@ function Resolve-FfmpegPath {
     $commonCandidates += (Join-Path $env:ChocolateyInstall "bin\ffmpeg.exe")
   }
 
-  if ($env:LOCALAPPDATA) {
-    $commonCandidates += (Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\ffmpeg.exe")
-
-    $winGetPackageRoot = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Packages"
-    try {
-      $ffmpegPackages = Get-ChildItem -LiteralPath $winGetPackageRoot -Directory -Filter "*FFmpeg*" -ErrorAction Stop
-      foreach ($package in $ffmpegPackages | Sort-Object LastWriteTime -Descending) {
-        try {
-          $buildDirectories = Get-ChildItem -LiteralPath $package.FullName -Directory -Filter "ffmpeg*-build" -ErrorAction Stop
-          foreach ($buildDirectory in $buildDirectories | Sort-Object LastWriteTime -Descending) {
-            $commonCandidates += (Join-Path $buildDirectory.FullName "bin\ffmpeg.exe")
-          }
-        } catch {
-        }
-      }
-    } catch {
-    }
-  }
-
   foreach ($item in $commonCandidates) {
-    if ([string]::IsNullOrWhiteSpace($item)) {
-      continue
-    }
-
-    try {
-      if (Test-Path -LiteralPath $item -PathType Leaf) {
-        try {
-          return (Resolve-Path -LiteralPath $item).Path
-        } catch {
-          return $item
-        }
-      }
-    } catch [System.UnauthorizedAccessException] {
-      if (Looks-LikeExecutablePath -Path $item) {
-        return $item
-      }
-    } catch {
+    if (-not [string]::IsNullOrWhiteSpace($item) -and (Test-Path -LiteralPath $item)) {
+      return (Resolve-Path -LiteralPath $item).Path
     }
   }
 
@@ -155,75 +64,56 @@ function New-DefaultOutputPath {
   return (Join-Path $inputItem.DirectoryName "$baseName.$suffix$extension")
 }
 
-try {
-  $resolvedInputPath = (Resolve-Path -LiteralPath $InputPath).Path
-  $resolvedFfmpegPath = Resolve-FfmpegPath -Candidate $FfmpegPath
+$resolvedInputPath = (Resolve-Path -LiteralPath $InputPath).Path
+$resolvedFfmpegPath = Resolve-FfmpegPath -Candidate $FfmpegPath
 
-  if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-    $OutputPath = New-DefaultOutputPath -ResolvedInputPath $resolvedInputPath -NormalizedRotation $Rotation
-  }
-
-  $resolvedOutputPath = [System.IO.Path]::GetFullPath($OutputPath)
-
-  if ($resolvedInputPath -eq $resolvedOutputPath) {
-    throw "Input and output paths must be different."
-  }
-
-  $outputDirectory = Split-Path -Parent $resolvedOutputPath
-  if (-not [string]::IsNullOrWhiteSpace($outputDirectory) -and -not (Test-Path -LiteralPath $outputDirectory)) {
-    New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
-  }
-
-  $ffmpegArgs = @(
-    "-hide_banner",
-    "-loglevel", "error"
-  )
-
-  if ($Overwrite) {
-    $ffmpegArgs += "-y"
-  } else {
-    $ffmpegArgs += "-n"
-  }
-
-  $ffmpegArgs += @(
-    "-display_rotation:v:0", $Rotation.ToString(),
-    "-i", $resolvedInputPath,
-    "-map", "0",
-    "-c", "copy",
-    $resolvedOutputPath
-  )
-
-  $stderrLogPath = Join-Path $env:TEMP ("video-rotate-ffmpeg-" + [guid]::NewGuid().ToString("N") + ".log")
-
-  try {
-    & $resolvedFfmpegPath @ffmpegArgs 2> $stderrLogPath
-    $ffmpegExitCode = $LASTEXITCODE
-  } finally {
-    $ffmpegErrorText = Read-TextFileSafely -Path $stderrLogPath
-    Remove-Item -LiteralPath $stderrLogPath -Force -ErrorAction SilentlyContinue
-  }
-
-  if ($ffmpegExitCode -ne 0) {
-    if ([string]::IsNullOrWhiteSpace($ffmpegErrorText)) {
-      throw "ffmpeg exited with code $ffmpegExitCode."
-    }
-
-    throw "ffmpeg exited with code $ffmpegExitCode.`r`n$ffmpegErrorText"
-  }
-
-  if (-not (Test-Path -LiteralPath $resolvedOutputPath)) {
-    throw "Output file was not created: $resolvedOutputPath"
-  }
-
-  $outputItem = Get-Item -LiteralPath $resolvedOutputPath
-  if ($outputItem.Length -le 0) {
-    throw "Output file is empty: $resolvedOutputPath"
-  }
-
-  Write-Output $outputItem.FullName
-} catch {
-  $message = $_.Exception.Message
-  Show-ErrorDialog -Message $message
-  Write-Error $message
-  exit 1
+if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+  $OutputPath = New-DefaultOutputPath -ResolvedInputPath $resolvedInputPath -NormalizedRotation $Rotation
 }
+
+$resolvedOutputPath = [System.IO.Path]::GetFullPath($OutputPath)
+
+if ($resolvedInputPath -eq $resolvedOutputPath) {
+  throw "Input and output paths must be different."
+}
+
+$outputDirectory = Split-Path -Parent $resolvedOutputPath
+if (-not [string]::IsNullOrWhiteSpace($outputDirectory) -and -not (Test-Path -LiteralPath $outputDirectory)) {
+  New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+}
+
+$ffmpegArgs = @(
+  "-hide_banner",
+  "-loglevel", "error"
+)
+
+if ($Overwrite) {
+  $ffmpegArgs += "-y"
+} else {
+  $ffmpegArgs += "-n"
+}
+
+$ffmpegArgs += @(
+  "-display_rotation:v:0", $Rotation.ToString(),
+  "-i", $resolvedInputPath,
+  "-map", "0",
+  "-c", "copy",
+  $resolvedOutputPath
+)
+
+& $resolvedFfmpegPath @ffmpegArgs
+
+if ($LASTEXITCODE -ne 0) {
+  throw "ffmpeg exited with code $LASTEXITCODE."
+}
+
+if (-not (Test-Path -LiteralPath $resolvedOutputPath)) {
+  throw "Output file was not created: $resolvedOutputPath"
+}
+
+$outputItem = Get-Item -LiteralPath $resolvedOutputPath
+if ($outputItem.Length -le 0) {
+  throw "Output file is empty: $resolvedOutputPath"
+}
+
+Write-Output $outputItem.FullName
